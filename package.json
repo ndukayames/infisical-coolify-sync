@@ -1,0 +1,13 @@
+{
+  "name": "infisical-coolify-sync",
+  "version": "1.0.0",
+  "description": "Webhook service that syncs secrets from Infisical to Coolify apps",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {},
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
