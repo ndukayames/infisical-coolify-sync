@@ -1,6 +1,8 @@
-require("dotenv").config({
-  path: require("path").resolve(__dirname, "..", ".env"),
-});
+try {
+  require("dotenv").config({
+    path: require("path").resolve(__dirname, "..", ".env"),
+  });
+} catch {}
 const http = require("http");
 
 // ─── Config ──────────────────────────────────────────────────────────
