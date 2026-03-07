@@ -116,14 +116,32 @@ async function fetchCoolifyApps() {
     uuid: a.uuid,
     name: a.name || a.fqdn || a.uuid,
     fqdn: a.fqdn || "",
+    status: a.status || "unknown",
   }));
+}
+
+// ─── Fetch single app status from Coolify ────────────────────────────
+async function fetchAppStatus(appUuid) {
+  const res = await fetch(`${COOLIFY_URL}/api/v1/applications/${appUuid}`, {
+    headers: { Authorization: `Bearer ${COOLIFY_API_TOKEN}` },
+  });
+  if (!res.ok) return "unknown";
+  const app = await res.json();
+  return app.status || "unknown";
 }
 
 // ─── HTML UI ─────────────────────────────────────────────────────────
 function renderUI(apps) {
   const appOptions = apps
-    .map((a) => `<option value="${a.uuid}">${a.name}</option>`)
+    .map(
+      (a) =>
+        `<option value="${a.uuid}" data-status="${a.status}">${a.name}</option>`,
+    )
     .join("\n            ");
+
+  const appsJson = JSON.stringify(
+    apps.map((a) => ({ uuid: a.uuid, name: a.name, status: a.status })),
+  );
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -169,6 +187,25 @@ function renderUI(apps) {
     .result.success { display: block; background: #064e3b; border: 1px solid #059669; color: #6ee7b7; }
     .result.error { display: block; background: #450a0a; border: 1px solid #dc2626; color: #fca5a5; white-space: pre-wrap; }
     .or-divider { text-align: center; color: #475569; font-size: 12px; margin: -8px 0 12px; }
+    .status-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; min-height: 28px; }
+    .status-badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 12px; border-radius: 20px; font-size: 12px;
+      font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px;
+    }
+    .status-badge .dot { width: 8px; height: 8px; border-radius: 50%; }
+    .status-running { background: #064e3b; color: #6ee7b7; }
+    .status-running .dot { background: #10b981; box-shadow: 0 0 6px #10b981; }
+    .status-stopped { background: #450a0a; color: #fca5a5; }
+    .status-stopped .dot { background: #ef4444; }
+    .status-deploying, .status-restarting { background: #422006; color: #fcd34d; }
+    .status-deploying .dot, .status-restarting .dot { background: #f59e0b; animation: pulse 1.5s infinite; }
+    .status-unknown { background: #1e293b; color: #64748b; border: 1px solid #334155; }
+    .status-unknown .dot { background: #64748b; }
+    .status-exited { background: #450a0a; color: #fca5a5; }
+    .status-exited .dot { background: #ef4444; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .app-name-label { font-size: 13px; color: #94a3b8; }
   </style>
 </head>
 <body>
@@ -181,6 +218,8 @@ function renderUI(apps) {
       <option value="">Select an app...</option>
       ${appOptions}
     </select>
+
+    <div class="status-bar" id="statusBar"></div>
 
     <label for="apiKey">API Key</label>
     <input type="password" id="apiKey" placeholder="Enter your API key">
@@ -212,9 +251,63 @@ function renderUI(apps) {
       reader.readAsText(file);
     });
 
+    const appsData = ${appsJson};
+    let statusInterval = null;
+
+    function getStatusClass(status) {
+      if (!status) return "status-unknown";
+      const s = status.toLowerCase().replace(":", "");
+      if (s.includes("running")) return "status-running";
+      if (s.includes("exited") || s.includes("error")) return "status-exited";
+      if (s.includes("stop")) return "status-stopped";
+      if (s.includes("deploy") || s.includes("building") || s.includes("starting")) return "status-deploying";
+      if (s.includes("restart")) return "status-restarting";
+      return "status-unknown";
+    }
+
+    function getStatusLabel(status) {
+      if (!status || status === "unknown") return "Unknown";
+      return status.replace(/:/g, "").replace(/_/g, " ").trim();
+    }
+
+    function renderStatus(status) {
+      const bar = document.getElementById("statusBar");
+      if (!status) { bar.innerHTML = ""; return; }
+      const cls = getStatusClass(status);
+      const label = getStatusLabel(status);
+      bar.innerHTML = '<span class="status-badge ' + cls + '"><span class="dot"></span>' + label + '</span>';
+    }
+
+    async function refreshStatus(uuid) {
+      try {
+        const res = await fetch("/app-status?app=" + encodeURIComponent(uuid));
+        if (res.ok) {
+          const data = await res.json();
+          renderStatus(data.status);
+        }
+      } catch (e) {}
+    }
+
+    function startStatusPolling(uuid) {
+      if (statusInterval) clearInterval(statusInterval);
+      refreshStatus(uuid);
+      statusInterval = setInterval(() => refreshStatus(uuid), 5000);
+    }
+
+    function stopStatusPolling() {
+      if (statusInterval) { clearInterval(statusInterval); statusInterval = null; }
+      document.getElementById("statusBar").innerHTML = "";
+    }
+
     document.getElementById("app").addEventListener("change", async (e) => {
       const uuid = e.target.value;
-      if (!uuid) { textarea.value = ""; return; }
+      if (!uuid) { textarea.value = ""; stopStatusPolling(); return; }
+
+      // Show initial status from page data
+      const appData = appsData.find(a => a.uuid === uuid);
+      if (appData) renderStatus(appData.status);
+      startStatusPolling(uuid);
+
       textarea.value = "Loading current env vars...";
       try {
         const res = await fetch("/app-envs?app=" + encodeURIComponent(uuid));
@@ -420,6 +513,26 @@ const server = http.createServer(async (req, res) => {
         .join("\n");
       res.writeHead(200, { "Content-Type": "text/plain" });
       res.end(envText);
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // App status endpoint
+  if (req.method === "GET" && req.url.startsWith("/app-status")) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const appUuid = url.searchParams.get("app");
+    if (!appUuid) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Missing app param" }));
+      return;
+    }
+    try {
+      const status = await fetchAppStatus(appUuid);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ uuid: appUuid, status }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: err.message }));

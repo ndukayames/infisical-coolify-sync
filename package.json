@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node src/index.js"
   },
-  "dependencies": {},
+  "dependencies": {
+    "nodemailer": "^8.0.1"
+  },
   "engines": {
     "node": ">=18.0.0"
   }
