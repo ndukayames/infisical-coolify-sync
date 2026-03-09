@@ -64,7 +64,7 @@ async function restartCoolifyApp(appUuid, resourceType = "application") {
   const basePath =
     resourceType === "service"
       ? `/api/v1/services/${appUuid}/restart`
-      : `/api/v1/applications/${appUuid}/restart`;
+      : `/api/v1/applications/${appUuid}/start?force_rebuild=true`;
 
   const res = await fetch(`${COOLIFY_URL}${basePath}`, {
     method: "GET",
