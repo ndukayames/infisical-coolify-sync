@@ -177,7 +177,7 @@ function renderUI(apps) {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Coolify Manager</title>
+  <title>App Manager</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
@@ -283,8 +283,8 @@ function renderUI(apps) {
     <div class="status-bar" id="statusBar"></div>
 
     <div class="tabs">
-      <button class="tab active" onclick="switchTab('env')" id="tabBtn-env">Environment</button>
-      <button class="tab" onclick="switchTab('deployments')" id="tabBtn-deployments">Deployments</button>
+      <button class="tab active" id="tabBtn-env">Environment</button>
+      <button class="tab" id="tabBtn-deployments">Deployments</button>
     </div>
 
     <div id="tab-env" class="tab-content active">
@@ -298,10 +298,10 @@ function renderUI(apps) {
     <input type="file" id="envFile" accept=".env,.txt">
     <p class="file-hint">Select a .env file from your computer</p>
 
-    <button id="submitBtn" onclick="submitEnv()">Upload & Restart</button>
+    <button id="submitBtn">Upload & Restart</button>
 
     <div class="or-divider">— or —</div>
-    <button id="restartBtn" onclick="restartOnly()" style="background:#f59e0b">Restart Only</button>
+    <button id="restartBtn" style="background:#f59e0b">Restart Only</button>
 
     <div id="result" class="result"></div>
     </div>
@@ -312,7 +312,7 @@ function renderUI(apps) {
       </div>
       <div id="logViewer" class="log-viewer" style="display:none">
         <div class="log-header">
-          <button class="log-back" onclick="closeLogViewer()">&#8592; Back</button>
+          <button class="log-back" id="logBackBtn">&#8592; Back</button>
           <span class="log-title" id="logTitle"></span>
           <span class="log-status" id="logStatus"></span>
         </div>
@@ -332,6 +332,13 @@ function renderUI(apps) {
       reader.onload = (ev) => { textarea.value = ev.target.result; };
       reader.readAsText(file);
     });
+
+    // Attach button handlers (avoids inline onclick in template literals)
+    document.getElementById("tabBtn-env").addEventListener("click", function() { switchTab("env"); });
+    document.getElementById("tabBtn-deployments").addEventListener("click", function() { switchTab("deployments"); });
+    document.getElementById("submitBtn").addEventListener("click", function() { submitEnv(); });
+    document.getElementById("restartBtn").addEventListener("click", function() { restartOnly(); });
+    document.getElementById("logBackBtn").addEventListener("click", function() { closeLogViewer(); });
 
     const appsData = ${appsJson};
     let statusInterval = null;
@@ -452,7 +459,7 @@ function renderUI(apps) {
         }
         list.innerHTML = '<div class="deploy-list">' + data.deployments.map(function(d) {
           var msg = d.commit_message ? d.commit_message.split('\\n')[0] : '';
-          return '<div class="deploy-item" onclick="viewDeploymentLog(\'' + d.deployment_uuid + '\')">'
+          return '<div class="deploy-item" data-deploy="' + d.deployment_uuid + '">'
             + '<span class="deploy-status ' + deployStatusClass(d.status) + '">' + deployStatusLabel(d.status) + '</span>'
             + '<div class="deploy-info">'
             + (d.commit ? '<span class="deploy-commit">' + d.commit + '</span> ' : '')
@@ -461,6 +468,10 @@ function renderUI(apps) {
             + '<span class="deploy-time">' + timeAgo(d.created_at) + '</span>'
             + '</div>';
         }).join('') + '</div>';
+        // Attach click handlers via event delegation (avoids quote escaping issues in template literals)
+        list.querySelectorAll('.deploy-item[data-deploy]').forEach(function(el) {
+          el.addEventListener('click', function() { viewDeploymentLog(el.dataset.deploy); });
+        });
       } catch (e) {
         list.innerHTML = '<div class="deploy-empty">Error loading deployments</div>';
       }
@@ -832,9 +843,10 @@ const server = http.createServer(async (req, res) => {
       const deployment = await apiRes.json();
       let logs = [];
       try {
-        logs = typeof deployment.logs === "string"
-          ? JSON.parse(deployment.logs)
-          : deployment.logs || [];
+        logs =
+          typeof deployment.logs === "string"
+            ? JSON.parse(deployment.logs)
+            : deployment.logs || [];
       } catch (e) {
         logs = [{ output: deployment.logs || "", type: "stdout" }];
       }
