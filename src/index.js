@@ -122,12 +122,41 @@ async function fetchCoolifyApps() {
 
 // ─── Fetch single app status from Coolify ────────────────────────────
 async function fetchAppStatus(appUuid) {
-  const res = await fetch(`${COOLIFY_URL}/api/v1/applications/${appUuid}`, {
-    headers: { Authorization: `Bearer ${COOLIFY_API_TOKEN}` },
-  });
-  if (!res.ok) return "unknown";
-  const app = await res.json();
-  return app.status || "unknown";
+  // Fetch container status and active deployments in parallel
+  // Note: per-app deployments endpoint is /deployments/applications/{uuid} (not /applications/{uuid}/deployments)
+  const [appRes, deployRes] = await Promise.all([
+    fetch(`${COOLIFY_URL}/api/v1/applications/${appUuid}`, {
+      headers: { Authorization: `Bearer ${COOLIFY_API_TOKEN}` },
+    }),
+    fetch(
+      `${COOLIFY_URL}/api/v1/deployments/applications/${appUuid}?skip=0&take=1`,
+      {
+        headers: { Authorization: `Bearer ${COOLIFY_API_TOKEN}` },
+      },
+    ),
+  ]);
+
+  const containerStatus = appRes.ok
+    ? (await appRes.json()).status || "unknown"
+    : "unknown";
+
+  let deploying = false;
+  if (deployRes.ok) {
+    const deployments = await deployRes.json();
+    // Response is { count, deployments: [...] }
+    const list = Array.isArray(deployments)
+      ? deployments
+      : deployments.deployments || deployments.data || [];
+    const active = list.find(
+      (d) =>
+        d.status === "in_progress" ||
+        d.status === "queued" ||
+        d.status === "building",
+    );
+    if (active) deploying = true;
+  }
+
+  return { container: containerStatus, deploying };
 }
 
 // ─── HTML UI ─────────────────────────────────────────────────────────
@@ -267,15 +296,22 @@ function renderUI(apps) {
 
     function getStatusLabel(status) {
       if (!status || status === "unknown") return "Unknown";
-      return status.replace(/:/g, "").replace(/_/g, " ").trim();
+      return status.replace(/:/g, " ").replace(/_/g, " ").trim();
     }
 
-    function renderStatus(status) {
+    function renderStatus(status, deploying) {
       const bar = document.getElementById("statusBar");
       if (!status) { bar.innerHTML = ""; return; }
+      let html = '';
+      // Show container status badge
       const cls = getStatusClass(status);
       const label = getStatusLabel(status);
-      bar.innerHTML = '<span class="status-badge ' + cls + '"><span class="dot"></span>' + label + '</span>';
+      html += '<span class="status-badge ' + cls + '"><span class="dot"></span>' + label + '</span>';
+      // Show deploying badge if a deployment is in progress
+      if (deploying) {
+        html += ' <span class="status-badge status-deploying"><span class="dot"></span>deploying</span>';
+      }
+      bar.innerHTML = html;
     }
 
     async function refreshStatus(uuid) {
@@ -283,7 +319,7 @@ function renderUI(apps) {
         const res = await fetch("/app-status?app=" + encodeURIComponent(uuid));
         if (res.ok) {
           const data = await res.json();
-          renderStatus(data.status);
+          renderStatus(data.status, data.deploying);
         }
       } catch (e) {}
     }
@@ -303,9 +339,9 @@ function renderUI(apps) {
       const uuid = e.target.value;
       if (!uuid) { textarea.value = ""; stopStatusPolling(); return; }
 
-      // Show initial status from page data
+      // Show initial status from page data (deploying unknown until first poll)
       const appData = appsData.find(a => a.uuid === uuid);
-      if (appData) renderStatus(appData.status);
+      if (appData) renderStatus(appData.status, false);
       startStatusPolling(uuid);
 
       textarea.value = "Loading current env vars...";
@@ -530,9 +566,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     try {
-      const status = await fetchAppStatus(appUuid);
+      const { container, deploying } = await fetchAppStatus(appUuid);
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ uuid: appUuid, status }));
+      res.end(JSON.stringify({ uuid: appUuid, status: container, deploying }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: err.message }));
