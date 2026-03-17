@@ -2,7 +2,9 @@ try {
   require("dotenv").config({
     path: require("path").resolve(__dirname, "..", ".env"),
   });
-} catch {}
+} catch (e) {
+  console.warn("dotenv load warning:", e.message);
+}
 const http = require("http");
 
 // ─── Config ──────────────────────────────────────────────────────────
@@ -10,6 +12,47 @@ const PORT = process.env.PORT || 3000;
 const COOLIFY_URL = process.env.COOLIFY_URL;
 const COOLIFY_API_TOKEN = process.env.COOLIFY_API_TOKEN;
 const UPLOAD_API_KEY = process.env.UPLOAD_API_KEY || "";
+
+// ─── Rate limiter (in-memory, per IP) ────────────────────────────────
+const rateLimitMap = new Map();
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
+const RATE_LIMIT_MAX = 10; // max attempts per window
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip) || { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+  if (now > entry.resetAt) {
+    entry.count = 0;
+    entry.resetAt = now + RATE_LIMIT_WINDOW_MS;
+  }
+  entry.count++;
+  rateLimitMap.set(ip, entry);
+  return entry.count > RATE_LIMIT_MAX;
+}
+
+// ─── UUID / ID validation ─────────────────────────────────────────────
+const SAFE_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+function isValidId(id) {
+  return typeof id === "string" && SAFE_ID_RE.test(id);
+}
+
+// ─── Server-side HTML escaping ────────────────────────────────────────
+function escHtmlServer(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ─── Safe JSON for inline <script> blocks ────────────────────────────
+function safeInlineJson(obj) {
+  return JSON.stringify(obj)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\//g, "\\u002f");
+}
 
 // ─── Validate config ─────────────────────────────────────────────────
 function validateConfig() {
@@ -164,11 +207,11 @@ function renderUI(apps) {
   const appOptions = apps
     .map(
       (a) =>
-        `<option value="${a.uuid}" data-status="${a.status}">${a.name}</option>`,
+        `<option value="${escHtmlServer(a.uuid)}" data-status="${escHtmlServer(a.status)}">${escHtmlServer(a.name)}</option>`,
     )
     .join("\n            ");
 
-  const appsJson = JSON.stringify(
+  const appsJson = safeInlineJson(
     apps.map((a) => ({ uuid: a.uuid, name: a.name, status: a.status })),
   );
 
@@ -344,8 +387,8 @@ function renderUI(apps) {
   </div>
 
   <script>
-    // ── API Key Auth ──
-    let SESSION_API_KEY = sessionStorage.getItem("apiKey") || "";
+    // ── API Key Auth (kept in memory only — not stored in sessionStorage/localStorage) ──
+    let SESSION_API_KEY = "";
 
     async function validateAndUnlock(key) {
       const errEl = document.getElementById("authError");
@@ -360,9 +403,11 @@ function renderUI(apps) {
         });
         if (res.ok) {
           SESSION_API_KEY = key;
-          sessionStorage.setItem("apiKey", key);
           document.getElementById("authOverlay").style.display = "none";
           document.getElementById("apiKey").value = key;
+        } else if (res.status === 429) {
+          errEl.textContent = "Too many attempts. Please wait and try again.";
+          errEl.style.display = "block";
         } else {
           errEl.textContent = "Invalid API key. Please try again.";
           errEl.style.display = "block";
@@ -388,11 +433,6 @@ function renderUI(apps) {
         if (key) validateAndUnlock(key);
       }
     });
-
-    // Auto-unlock if key already in session
-    if (SESSION_API_KEY) {
-      validateAndUnlock(SESSION_API_KEY);
-    }
 
     const fileInput = document.getElementById("envFile");
     const textarea = document.getElementById("envContent");
@@ -448,7 +488,9 @@ function renderUI(apps) {
 
     async function refreshStatus(uuid) {
       try {
-        const res = await fetch("/app-status?app=" + encodeURIComponent(uuid));
+        const res = await fetch("/app-status?app=" + encodeURIComponent(uuid), {
+          headers: { "x-api-key": SESSION_API_KEY },
+        });
         if (res.ok) {
           const data = await res.json();
           renderStatus(data.status, data.deploying);
@@ -522,7 +564,9 @@ function renderUI(apps) {
       if (!uuid) { list.innerHTML = '<div class="deploy-empty">Select an app to view deployments</div>'; return; }
       list.innerHTML = '<div class="deploy-empty">Loading deployments...</div>';
       try {
-        const res = await fetch('/deployment-logs?app=' + encodeURIComponent(uuid) + '&take=15');
+        const res = await fetch('/deployment-logs?app=' + encodeURIComponent(uuid) + '&take=15', {
+          headers: { "x-api-key": SESSION_API_KEY },
+        });
         if (!res.ok) throw new Error('Failed to load');
         const data = await res.json();
         if (!data.deployments || !data.deployments.length) {
@@ -566,7 +610,9 @@ function renderUI(apps) {
       const title = document.getElementById('logTitle');
       const statusEl = document.getElementById('logStatus');
       try {
-        const res = await fetch('/deployment-log/' + encodeURIComponent(deployUuid));
+        const res = await fetch('/deployment-log/' + encodeURIComponent(deployUuid), {
+          headers: { "x-api-key": SESSION_API_KEY },
+        });
         if (!res.ok) throw new Error('Failed to load log');
         const data = await res.json();
         title.textContent = deployUuid;
@@ -771,7 +817,7 @@ const server = http.createServer(async (req, res) => {
       res.end(html);
     } catch (err) {
       res.writeHead(500, { "Content-Type": "text/html" });
-      res.end(`<h1>Error loading apps: ${err.message}</h1>`);
+      res.end(`<h1>Error loading apps. Please try again.</h1>`);
     }
     return;
   }
@@ -797,13 +843,19 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ message: `Restart queued for ${appUuid}` }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ error: "Failed to restart app" }));
     }
     return;
   }
 
   // Validate API key
   if (req.method === "POST" && req.url === "/validate-key") {
+    const ip = req.socket.remoteAddress || "unknown";
+    if (isRateLimited(ip)) {
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Too many attempts. Please wait." }));
+      return;
+    }
     const apiKey = req.headers["x-api-key"];
     if (!UPLOAD_API_KEY || apiKey !== UPLOAD_API_KEY) {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -825,9 +877,9 @@ const server = http.createServer(async (req, res) => {
     }
     const url = new URL(req.url, `http://${req.headers.host}`);
     const appUuid = url.searchParams.get("app");
-    if (!appUuid) {
+    if (!appUuid || !isValidId(appUuid)) {
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing app param" }));
+      res.end(JSON.stringify({ error: "Missing or invalid app param" }));
       return;
     }
     try {
@@ -849,18 +901,24 @@ const server = http.createServer(async (req, res) => {
       res.end(envText);
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ error: "Failed to fetch envs" }));
     }
     return;
   }
 
   // App status endpoint
   if (req.method === "GET" && req.url.startsWith("/app-status")) {
+    const apiKey = req.headers["x-api-key"];
+    if (!UPLOAD_API_KEY || apiKey !== UPLOAD_API_KEY) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
     const url = new URL(req.url, `http://${req.headers.host}`);
     const appUuid = url.searchParams.get("app");
-    if (!appUuid) {
+    if (!appUuid || !isValidId(appUuid)) {
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing app param" }));
+      res.end(JSON.stringify({ error: "Missing or invalid app param" }));
       return;
     }
     try {
@@ -869,20 +927,28 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ uuid: appUuid, status: container, deploying }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ error: "Failed to fetch app status" }));
     }
     return;
   }
 
   // Deployment history for an app
   if (req.method === "GET" && req.url.startsWith("/deployment-logs")) {
+    const apiKey = req.headers["x-api-key"];
+    if (!UPLOAD_API_KEY || apiKey !== UPLOAD_API_KEY) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
     const url = new URL(req.url, `http://${req.headers.host}`);
     const appUuid = url.searchParams.get("app");
-    const take = url.searchParams.get("take") || "15";
-    const skip = url.searchParams.get("skip") || "0";
-    if (!appUuid) {
+    const takeRaw = parseInt(url.searchParams.get("take") || "15", 10);
+    const skipRaw = parseInt(url.searchParams.get("skip") || "0", 10);
+    const take = isNaN(takeRaw) || takeRaw < 1 || takeRaw > 50 ? 15 : takeRaw;
+    const skip = isNaN(skipRaw) || skipRaw < 0 ? 0 : skipRaw;
+    if (!appUuid || !isValidId(appUuid)) {
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing app param" }));
+      res.end(JSON.stringify({ error: "Missing or invalid app param" }));
       return;
     }
     try {
@@ -910,17 +976,23 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({ count: data.count || 0, deployments }));
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ error: "Failed to fetch deployments" }));
     }
     return;
   }
 
   // Single deployment log
   if (req.method === "GET" && req.url.startsWith("/deployment-log/")) {
+    const apiKey = req.headers["x-api-key"];
+    if (!UPLOAD_API_KEY || apiKey !== UPLOAD_API_KEY) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Unauthorized" }));
+      return;
+    }
     const deployUuid = req.url.split("/deployment-log/")[1]?.split("?")[0];
-    if (!deployUuid) {
+    if (!deployUuid || !isValidId(deployUuid)) {
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Missing deployment UUID" }));
+      res.end(JSON.stringify({ error: "Missing or invalid deployment UUID" }));
       return;
     }
     try {
@@ -960,7 +1032,7 @@ const server = http.createServer(async (req, res) => {
       );
     } catch (err) {
       res.writeHead(500, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ error: "Failed to fetch deployment log" }));
     }
     return;
   }
@@ -985,21 +1057,32 @@ const server = http.createServer(async (req, res) => {
     // Get coolifyAppUuid from query string
     const url = new URL(req.url, `http://${req.headers.host}`);
     const appUuid = url.searchParams.get("app");
-    if (!appUuid) {
+    if (!appUuid || !isValidId(appUuid)) {
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(
-        JSON.stringify({
-          error: "Missing 'app' query parameter (Coolify app UUID)",
-        }),
-      );
+      res.end(JSON.stringify({ error: "Missing or invalid app param" }));
       return;
     }
 
-    const resourceType = url.searchParams.get("type") || "application";
+    const resourceTypeRaw = url.searchParams.get("type") || "application";
+    const resourceType = ["application", "service"].includes(resourceTypeRaw)
+      ? resourceTypeRaw
+      : "application";
 
+    const MAX_BODY_BYTES = 1 * 1024 * 1024; // 1MB
     let body = "";
-    req.on("data", (chunk) => (body += chunk));
+    let bodySize = 0;
+    let bodyTooLarge = false;
+    req.on("data", (chunk) => {
+      bodySize += chunk.length;
+      if (bodySize > MAX_BODY_BYTES) { bodyTooLarge = true; req.destroy(); return; }
+      body += chunk;
+    });
     req.on("end", async () => {
+      if (bodyTooLarge) {
+        res.writeHead(413, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "Request body too large (max 1MB)" }));
+        return;
+      }
       try {
         const secrets = parseEnvFile(body);
         if (!secrets.length) {
@@ -1024,7 +1107,7 @@ const server = http.createServer(async (req, res) => {
       } catch (err) {
         console.error(`Upload-env error: ${err.message}`);
         res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
+        res.end(JSON.stringify({ error: "Failed to update env vars" }));
       }
     });
     return;
