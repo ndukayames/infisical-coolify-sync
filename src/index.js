@@ -234,6 +234,17 @@ function renderUI(apps) {
     .status-exited { background: #450a0a; color: #fca5a5; }
     .status-exited .dot { background: #ef4444; }
     @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    #authOverlay {
+      position: fixed; inset: 0; background: #0f172a; z-index: 100;
+      display: flex; align-items: center; justify-content: center; padding: 16px;
+    }
+    #authOverlay .auth-card {
+      background: #1e293b; border-radius: 12px; padding: 32px;
+      width: 100%; max-width: 400px; box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+    }
+    #authOverlay h2 { font-size: 18px; color: #f8fafc; margin-bottom: 6px; }
+    #authOverlay p { font-size: 13px; color: #64748b; margin-bottom: 24px; }
+    #authError { color: #fca5a5; font-size: 13px; margin-top: -8px; margin-bottom: 12px; display: none; }
     .app-name-label { font-size: 13px; color: #94a3b8; }
     .tabs { display: flex; gap: 0; margin-bottom: 16px; border-bottom: 2px solid #1e293b; }
     .tab { flex: 1; padding: 10px; background: none; border: none; color: #64748b; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -2px; transition: all 0.2s; }
@@ -270,6 +281,17 @@ function renderUI(apps) {
   </style>
 </head>
 <body>
+  <div id="authOverlay">
+    <div class="auth-card">
+      <h2>Coolify Manager</h2>
+      <p>Enter your API key to continue</p>
+      <label for="authKeyInput">API Key</label>
+      <input type="password" id="authKeyInput" placeholder="Enter your API key" autocomplete="current-password">
+      <div id="authError"></div>
+      <button id="authSubmitBtn">Continue</button>
+    </div>
+  </div>
+
   <div class="card">
     <h1>Coolify Manager</h1>
     <p class="subtitle">Manage applications, environments, and deployments</p>
@@ -322,6 +344,56 @@ function renderUI(apps) {
   </div>
 
   <script>
+    // ── API Key Auth ──
+    let SESSION_API_KEY = sessionStorage.getItem("apiKey") || "";
+
+    async function validateAndUnlock(key) {
+      const errEl = document.getElementById("authError");
+      const btn = document.getElementById("authSubmitBtn");
+      errEl.style.display = "none";
+      btn.disabled = true;
+      btn.textContent = "Validating...";
+      try {
+        const res = await fetch("/validate-key", {
+          method: "POST",
+          headers: { "x-api-key": key },
+        });
+        if (res.ok) {
+          SESSION_API_KEY = key;
+          sessionStorage.setItem("apiKey", key);
+          document.getElementById("authOverlay").style.display = "none";
+          document.getElementById("apiKey").value = key;
+        } else {
+          errEl.textContent = "Invalid API key. Please try again.";
+          errEl.style.display = "block";
+        }
+      } catch (e) {
+        errEl.textContent = "Network error. Please try again.";
+        errEl.style.display = "block";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "Continue";
+      }
+    }
+
+    document.getElementById("authSubmitBtn").addEventListener("click", function() {
+      const key = document.getElementById("authKeyInput").value.trim();
+      if (!key) return;
+      validateAndUnlock(key);
+    });
+
+    document.getElementById("authKeyInput").addEventListener("keydown", function(e) {
+      if (e.key === "Enter") {
+        const key = this.value.trim();
+        if (key) validateAndUnlock(key);
+      }
+    });
+
+    // Auto-unlock if key already in session
+    if (SESSION_API_KEY) {
+      validateAndUnlock(SESSION_API_KEY);
+    }
+
     const fileInput = document.getElementById("envFile");
     const textarea = document.getElementById("envContent");
 
@@ -551,7 +623,9 @@ function renderUI(apps) {
 
       textarea.value = "Loading current env vars...";
       try {
-        const res = await fetch("/app-envs?app=" + encodeURIComponent(uuid));
+        const res = await fetch("/app-envs?app=" + encodeURIComponent(uuid), {
+          headers: { "x-api-key": SESSION_API_KEY },
+        });
         if (res.ok) {
           textarea.value = await res.text();
         } else {
@@ -728,8 +802,27 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Validate API key
+  if (req.method === "POST" && req.url === "/validate-key") {
+    const apiKey = req.headers["x-api-key"];
+    if (!UPLOAD_API_KEY || apiKey !== UPLOAD_API_KEY) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid API key" }));
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
   // Fetch envs for an app
   if (req.method === "GET" && req.url.startsWith("/app-envs")) {
+    const apiKey = req.headers["x-api-key"];
+    if (!UPLOAD_API_KEY || apiKey !== UPLOAD_API_KEY) {
+      res.writeHead(401, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid or missing API key" }));
+      return;
+    }
     const url = new URL(req.url, `http://${req.headers.host}`);
     const appUuid = url.searchParams.get("app");
     if (!appUuid) {
