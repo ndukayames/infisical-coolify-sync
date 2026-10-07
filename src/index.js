@@ -66,6 +66,65 @@ function validateConfig() {
   }
 }
 
+// ─── Read current Coolify env vars ───────────────────────────────────
+// Only production rows. Coolify keeps a parallel row per key for preview
+// deployments; those are never written by this service, so including them
+// would report phantom changes.
+async function fetchCoolifyEnvs(appUuid, resourceType = "application") {
+  const basePath =
+    resourceType === "service"
+      ? `/api/v1/services/${appUuid}/envs`
+      : `/api/v1/applications/${appUuid}/envs`;
+
+  const res = await fetch(`${COOLIFY_URL}${basePath}`, {
+    headers: { Authorization: `Bearer ${COOLIFY_API_TOKEN}` },
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Coolify env fetch failed (${res.status}): ${text}`);
+  }
+
+  const current = new Map();
+  for (const row of await res.json()) {
+    if (row.is_preview) continue;
+    current.set(row.key, row.value ?? "");
+  }
+  return current;
+}
+
+// ─── Diff an uploaded .env against what Coolify currently holds ──────
+// The bulk PATCH upserts every key it is given, so an upload silently
+// rewrites any variable the file still carries an old value for. Keys
+// absent from the upload are left untouched by Coolify and reported as
+// "untouched" so the uploader can see what this file does not cover.
+function computeEnvDiff(secrets, current) {
+  const added = [];
+  const changed = [];
+  const seen = new Set();
+
+  for (const { key, value } of secrets) {
+    seen.add(key);
+    if (!current.has(key)) {
+      added.push({ key, to: value });
+    } else if (current.get(key) !== value) {
+      changed.push({ key, from: current.get(key), to: value });
+    }
+  }
+
+  const untouched = [...current.keys()].filter((key) => !seen.has(key)).sort();
+  added.sort((a, b) => a.key.localeCompare(b.key));
+  changed.sort((a, b) => a.key.localeCompare(b.key));
+
+  return { added, changed, untouched, hasChanges: added.length > 0 || changed.length > 0 };
+}
+
+// Keep secret values out of the container logs; the uploader still sees
+// full values in the confirmation response.
+function maskForLog(value) {
+  if (value === "") return "<empty>";
+  return value.length <= 8 ? value : `${value.slice(0, 4)}…(${value.length})`;
+}
+
 // ─── Update Coolify env vars ─────────────────────────────────────────
 async function updateCoolifyEnvs(
   appUuid,
@@ -258,6 +317,18 @@ function renderUI(apps) {
     }
     .result.success { display: block; background: #064e3b; border: 1px solid #059669; color: #6ee7b7; }
     .result.error { display: block; background: #450a0a; border: 1px solid #dc2626; color: #fca5a5; white-space: pre-wrap; }
+    .result.confirm { display: block; background: #422006; border: 1px solid #d97706; color: #fcd34d; }
+    .diff-title { font-weight: 600; margin-bottom: 10px; }
+    .diff-list { margin: 0 0 10px; padding: 0; list-style: none; max-height: 260px; overflow-y: auto; }
+    .diff-list li { padding: 3px 0; border-bottom: 1px solid rgba(217,119,6,0.25); }
+    .diff-key { color: #fde68a; }
+    .diff-from { color: #fca5a5; text-decoration: line-through; }
+    .diff-to { color: #6ee7b7; }
+    .diff-note { color: #a8a29e; font-size: 12px; margin-bottom: 10px; }
+    .diff-actions { display: flex; gap: 8px; margin-top: 4px; }
+    .diff-actions button { margin: 0; flex: 1; }
+    .diff-cancel { background: #475569; }
+    .diff-cancel:hover { background: #64748b; }
     .or-divider { text-align: center; color: #475569; font-size: 12px; margin: -8px 0 12px; }
     .status-bar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; min-height: 28px; }
     .status-badge {
@@ -731,28 +802,104 @@ function renderUI(apps) {
       if (errors.length) return showError("Validation errors:\\n" + errors.join("\\n"));
       if (varCount === 0) return showError("No valid env vars found");
 
-      btn.disabled = true;
-      btn.textContent = "Uploading...";
+      await send(false);
 
-      try {
-        const res = await fetch("/upload-env?app=" + encodeURIComponent(app), {
-          method: "POST",
-          headers: { "x-api-key": apiKey, "Content-Type": "text/plain" },
-          body: envContent,
-        });
-        const data = await res.json();
-        if (res.ok) {
-          resultEl.className = "result success";
-          resultEl.textContent = data.message;
-          resultEl.style.display = "block";
-        } else {
-          showError(data.error || "Upload failed");
+      // confirmed === false asks the server what this file would change and
+      // writes nothing. confirmed === true applies the change the user approved.
+      async function send(confirmed) {
+        btn.disabled = true;
+        btn.textContent = confirmed ? "Applying..." : "Checking changes...";
+
+        try {
+          const res = await fetch(
+            "/upload-env?app=" + encodeURIComponent(app) + (confirmed ? "&confirm=1" : ""),
+            {
+              method: "POST",
+              headers: { "x-api-key": apiKey, "Content-Type": "text/plain" },
+              body: envContent,
+            },
+          );
+          const data = await res.json();
+
+          if (res.status === 409 && data.status === "confirm-required") {
+            showDiff(data);
+          } else if (res.ok) {
+            resultEl.className = "result success";
+            resultEl.textContent = data.message;
+            resultEl.style.display = "block";
+          } else {
+            showError(data.error || "Upload failed");
+          }
+        } catch (err) {
+          showError("Network error: " + err.message);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Upload & Restart";
         }
-      } catch (err) {
-        showError("Network error: " + err.message);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = "Upload & Restart";
+      }
+
+      function esc(str) {
+        return String(str).replace(/[&<>"]/g, (ch) =>
+          ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[ch],
+        );
+      }
+
+      function shown(value) {
+        return value === "" ? "(empty)" : value;
+      }
+
+      function showDiff(data) {
+        const d = data.diff;
+        let html = '<div class="diff-title">Review before applying</div>';
+
+        if (d.changed.length) {
+          html += "<div>" + d.changed.length + " variable(s) will CHANGE:</div><ul class=\\"diff-list\\">";
+          for (const c of d.changed) {
+            html +=
+              '<li><span class="diff-key">' + esc(c.key) + '</span>: ' +
+              '<span class="diff-from">' + esc(shown(c.from)) + '</span> → ' +
+              '<span class="diff-to">' + esc(shown(c.to)) + '</span></li>';
+          }
+          html += "</ul>";
+        }
+
+        if (d.added.length) {
+          html += "<div>" + d.added.length + " variable(s) will be ADDED:</div><ul class=\\"diff-list\\">";
+          for (const a of d.added) {
+            html +=
+              '<li><span class="diff-key">' + esc(a.key) + '</span>: ' +
+              '<span class="diff-to">' + esc(shown(a.to)) + '</span></li>';
+          }
+          html += "</ul>";
+        }
+
+        if (d.untouched.length) {
+          html +=
+            '<div class="diff-note">' + d.untouched.length +
+            " variable(s) are not in this file and will be left as they are.</div>";
+        }
+
+        html +=
+          '<div class="diff-actions">' +
+          '<button id="diffConfirm">Apply & Restart</button>' +
+          '<button id="diffCancel" class="diff-cancel">Cancel</button>' +
+          "</div>";
+
+        resultEl.className = "result confirm";
+        resultEl.innerHTML = html;
+        resultEl.style.display = "block";
+
+        document.getElementById("diffConfirm").addEventListener("click", () => {
+          resultEl.className = "result";
+          resultEl.style.display = "none";
+          resultEl.innerHTML = "";
+          send(true);
+        });
+        document.getElementById("diffCancel").addEventListener("click", () => {
+          resultEl.className = "result";
+          resultEl.style.display = "none";
+          resultEl.innerHTML = "";
+        });
       }
 
       function showError(msg) {
@@ -1091,9 +1238,52 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
+        const current = await fetchCoolifyEnvs(appUuid, resourceType);
+        const diff = computeEnvDiff(secrets, current);
+
+        if (!diff.hasChanges) {
+          console.log(
+            `\nUpload-env: ${secrets.length} vars for ${resourceType} ${appUuid} — no changes, nothing written`,
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              status: "no-changes",
+              message: "This file matches what is already deployed. Nothing was changed.",
+              diff,
+            }),
+          );
+          return;
+        }
+
+        // First call always reports the diff and writes nothing. The client
+        // re-sends with confirm=1 once the uploader has approved it.
+        if (url.searchParams.get("confirm") !== "1") {
+          console.log(
+            `\nUpload-env: ${secrets.length} vars for ${resourceType} ${appUuid} — awaiting confirmation ` +
+              `(${diff.added.length} new, ${diff.changed.length} changed)`,
+          );
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              status: "confirm-required",
+              message: `This upload will change ${diff.changed.length} and add ${diff.added.length} variable(s).`,
+              diff,
+            }),
+          );
+          return;
+        }
+
         console.log(
-          `\nUpload-env: ${secrets.length} vars for ${resourceType} ${appUuid}`,
+          `\nUpload-env: ${secrets.length} vars for ${resourceType} ${appUuid} — confirmed`,
         );
+        for (const { key, from, to } of diff.changed) {
+          console.log(`  ~ ${key}: ${maskForLog(from)} -> ${maskForLog(to)}`);
+        }
+        for (const { key, to } of diff.added) {
+          console.log(`  + ${key}: ${maskForLog(to)}`);
+        }
+
         await updateCoolifyEnvs(appUuid, secrets, resourceType);
         await restartCoolifyApp(appUuid, resourceType);
         console.log(`✓ Upload-env synced & restarted: ${appUuid}`);
@@ -1101,7 +1291,11 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(
           JSON.stringify({
-            message: `Updated ${secrets.length} env vars and restarted ${appUuid}`,
+            status: "applied",
+            message:
+              `Updated ${diff.changed.length} and added ${diff.added.length} env var(s), ` +
+              `then restarted ${appUuid}`,
+            diff,
           }),
         );
       } catch (err) {
